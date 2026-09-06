@@ -27,6 +27,7 @@ class ChatGPTGartenbewaesserung extends IPSModule
         $this->RegisterAttributeString('PendingStarts', '{}');
         $this->RegisterAttributeInteger('MainCloseDue', 0);
         $this->RegisterAttributeString('ConfiguredRuntimes', '{}');
+        $this->RegisterAttributeString('ActiveValves', '[]');
 
         $this->RegisterTimer('Tick', 0, 'CGI_Tick($_IPS[\'TARGET\']);');
         $this->RegisterVariableString('SystemStatus', 'Systemstatus', '', 1);
@@ -38,7 +39,7 @@ class ChatGPTGartenbewaesserung extends IPSModule
         parent::ApplyChanges();
 
         $this->CreateProfiles();
-        $this->SetValue('ModuleVersion', '1.3.0');
+        $this->SetValue('ModuleVersion', '1.4.0');
 
         $mainValveID = $this->ReadPropertyInteger('MainValveID');
         if (!$this->IsUsableBooleanActionVariable($mainValveID)) {
@@ -61,6 +62,8 @@ class ChatGPTGartenbewaesserung extends IPSModule
         $pendingStarts = $this->ReadPendingStarts();
         $previousConfiguredRuntimes = $this->ReadConfiguredRuntimes();
         $currentConfiguredRuntimes = [];
+        $reconstructedActiveValves = [];
+        $now = time();
 
         foreach ($valves as $valve) {
             if (!$valve['Enabled']) {
@@ -99,8 +102,6 @@ class ChatGPTGartenbewaesserung extends IPSModule
             $currentConfiguredRuntimes[$valveKey] = $configuredRuntime;
             $previousRuntime = isset($previousConfiguredRuntimes[$valveKey]) ? (int) $previousConfiguredRuntimes[$valveKey] : null;
 
-            // Eine geaenderte Standardlaufzeit aus der Modulkonfiguration genau einmal uebernehmen.
-            // Manuelle Laufzeitaenderungen in IPSView bleiben danach erhalten, bis die Konfiguration erneut geaendert wird.
             if ($previousRuntime === null || $previousRuntime !== $configuredRuntime || GetValueInteger($runtimeID) <= 0) {
                 SetValueInteger($runtimeID, $configuredRuntime);
             }
@@ -108,25 +109,36 @@ class ChatGPTGartenbewaesserung extends IPSModule
             $endTime = isset($endTimes[$valveKey]) ? (int) $endTimes[$valveKey] : 0;
             $pending = isset($pendingStarts[$valveKey]);
             $physicallyOpen = @GetValueBoolean($valve['ValveID']);
+            $logicallyOn = @GetValueBoolean($switchID);
 
             if ($pending) {
+                $reconstructedActiveValves[] = (int) $valve['ValveID'];
                 SetValueBoolean($switchID, true);
                 SetValueString($remainingID, '00:00 min');
                 SetValueString($this->GetIDForIdent($base . '_Status'), 'Startet - Ventil oeffnet nach Verzoegerung');
-            } elseif ($endTime > time() && $physicallyOpen) {
+            } elseif ($endTime > $now && ($physicallyOpen || $logicallyOn)) {
+                $reconstructedActiveValves[] = (int) $valve['ValveID'];
                 SetValueBoolean($switchID, true);
-                SetValueString($remainingID, $this->FormatRemaining(max(0, $endTime - time())));
+                SetValueString($remainingID, $this->FormatRemaining(max(0, $endTime - $now)));
                 SetValueString($this->GetIDForIdent($base . '_Status'), 'Bewaessert');
+            } elseif ($physicallyOpen || $logicallyOn) {
+                // Sicherheitsprinzip: ein logisch oder physisch aktiver Kreis gilt als aktiv,
+                // auch wenn nach einem Update keine gueltige Endzeit vorhanden ist.
+                $reconstructedActiveValves[] = (int) $valve['ValveID'];
+                SetValueBoolean($switchID, true);
+                SetValueString($remainingID, $endTime > $now ? $this->FormatRemaining($endTime - $now) : '00:00 min');
+                SetValueString($this->GetIDForIdent($base . '_Status'), $physicallyOpen ? 'Aktiv' : 'Logisch aktiv');
             } else {
-                if ($endTime > 0 && $endTime <= time()) {
+                if ($endTime > 0 && $endTime <= $now) {
                     unset($endTimes[$valveKey]);
                 }
                 SetValueBoolean($switchID, false);
                 SetValueString($remainingID, '00:00 min');
-                SetValueString($this->GetIDForIdent($base . '_Status'), $physicallyOpen ? 'Extern aktiv' : 'Aus');
+                SetValueString($this->GetIDForIdent($base . '_Status'), 'Aus');
             }
         }
 
+        $this->WriteActiveValves($reconstructedActiveValves);
         $this->WriteConfiguredRuntimes($currentConfiguredRuntimes);
         $this->WriteEndTimes($endTimes);
         $this->SetStatus(102);
@@ -156,7 +168,7 @@ class ChatGPTGartenbewaesserung extends IPSModule
             $runtime = $this->ClampRuntime((int) $Value);
             SetValueInteger($this->GetIDForIdent($Ident), $runtime);
 
-            if (@GetValueBoolean($valveID)) {
+            if ($this->IsValveActive($valveID)) {
                 $endTimes = $this->ReadEndTimes();
                 $endTimes[(string) $valveID] = time() + ($runtime * 60);
                 $this->WriteEndTimes($endTimes);
@@ -185,6 +197,7 @@ class ChatGPTGartenbewaesserung extends IPSModule
         $statusID = $this->GetIDForIdent($base . '_Status');
 
         $this->WriteAttributeInteger('MainCloseDue', 0);
+        $this->AddActiveValve($ValveID);
 
         try {
             if (!@GetValueBoolean($mainValveID)) {
@@ -214,6 +227,7 @@ class ChatGPTGartenbewaesserung extends IPSModule
             SetValueBoolean($switchID, false);
             SetValueString($statusID, 'Fehler: ' . $e->getMessage());
             $this->RemovePendingStart($ValveID);
+            $this->RemoveActiveValve($ValveID);
             $this->ScheduleMainValveCloseIfPossible();
             $this->UpdateTimerState();
             throw $e;
@@ -246,6 +260,9 @@ class ChatGPTGartenbewaesserung extends IPSModule
             $endTimes = $this->ReadEndTimes();
             unset($endTimes[(string) $ValveID]);
             $this->WriteEndTimes($endTimes);
+
+            // Erst nachdem genau dieser Kreis beendet wurde, aus der aktiven Liste entfernen.
+            $this->RemoveActiveValve($ValveID);
 
             $this->ScheduleMainValveCloseIfPossible();
             $this->UpdateTimerState();
@@ -284,6 +301,7 @@ class ChatGPTGartenbewaesserung extends IPSModule
         }
 
         $this->WriteEndTimes([]);
+        $this->WriteActiveValves([]);
         $this->ScheduleMainValveCloseIfPossible(true);
         $this->UpdateTimerState();
     }
@@ -316,6 +334,7 @@ class ChatGPTGartenbewaesserung extends IPSModule
 
             $valve = $this->FindValve($valveID);
             if ($valve === null || !$valve['Enabled']) {
+                $this->RemoveActiveValve($valveID);
                 continue;
             }
 
@@ -324,6 +343,7 @@ class ChatGPTGartenbewaesserung extends IPSModule
             $statusID = @$this->GetIDForIdent($base . '_Status');
 
             if ($switchID <= 0 || !GetValueBoolean($switchID)) {
+                $this->RemoveActiveValve($valveID);
                 continue;
             }
 
@@ -342,6 +362,7 @@ class ChatGPTGartenbewaesserung extends IPSModule
                 if ($statusID > 0) {
                     SetValueString($statusID, 'Fehler: ' . $e->getMessage());
                 }
+                $this->RemoveActiveValve($valveID);
                 $this->ScheduleMainValveCloseIfPossible();
             }
         }
@@ -355,6 +376,8 @@ class ChatGPTGartenbewaesserung extends IPSModule
         $runtimeID = $this->GetIDForIdent($base . '_Runtime');
         $switchID = $this->GetIDForIdent($base . '_Switch');
         $statusID = $this->GetIDForIdent($base . '_Status');
+
+        $this->AddActiveValve($ValveID);
 
         $runtime = $this->ClampRuntime(GetValueInteger($runtimeID));
         SetValueInteger($runtimeID, $runtime);
@@ -480,6 +503,10 @@ class ChatGPTGartenbewaesserung extends IPSModule
             $active = true;
         }
 
+        if (!$active && count($this->ReadActiveValves()) > 0) {
+            $active = true;
+        }
+
         $this->SetTimerInterval('Tick', $active ? 1000 : 0);
     }
 
@@ -543,6 +570,13 @@ class ChatGPTGartenbewaesserung extends IPSModule
 
     private function AnyConfiguredValveActive()
     {
+        // Primaere und verbindliche Quelle: explizite interne Liste der aktiven Kreise.
+        $activeValves = $this->ReadActiveValves();
+        if (count($activeValves) > 0) {
+            return true;
+        }
+
+        // Zusaetzliche Sicherheitsnetze fuer externe Schaltungen bzw. Altzustand nach Updates.
         $valves = $this->GetConfiguredValves();
         if (!is_array($valves)) {
             return false;
@@ -582,24 +616,58 @@ class ChatGPTGartenbewaesserung extends IPSModule
         return false;
     }
 
-    private function AnyConfiguredValvePhysicallyOpen(int $IgnoreValveID = 0)
+    private function IsValveActive(int $ValveID)
     {
-        $valves = $this->GetConfiguredValves();
-        if (!is_array($valves)) {
-            return false;
+        return in_array($ValveID, $this->ReadActiveValves(), true);
+    }
+
+    private function ReadActiveValves()
+    {
+        $data = json_decode($this->ReadAttributeString('ActiveValves'), true);
+        if (!is_array($data)) {
+            return [];
         }
 
-        foreach ($valves as $valve) {
-            if (!$valve['Enabled'] || $valve['ValveID'] === $IgnoreValveID) {
-                continue;
-            }
-
-            if (IPS_VariableExists($valve['ValveID']) && @GetValueBoolean($valve['ValveID'])) {
-                return true;
+        $result = [];
+        foreach ($data as $id) {
+            $id = (int) $id;
+            if ($id > 0 && !in_array($id, $result, true)) {
+                $result[] = $id;
             }
         }
+        return $result;
+    }
 
-        return false;
+    private function WriteActiveValves(array $ValveIDs)
+    {
+        $clean = [];
+        foreach ($ValveIDs as $id) {
+            $id = (int) $id;
+            if ($id > 0 && !in_array($id, $clean, true)) {
+                $clean[] = $id;
+            }
+        }
+        $this->WriteAttributeString('ActiveValves', json_encode($clean));
+    }
+
+    private function AddActiveValve(int $ValveID)
+    {
+        $active = $this->ReadActiveValves();
+        if (!in_array($ValveID, $active, true)) {
+            $active[] = $ValveID;
+            $this->WriteActiveValves($active);
+        }
+    }
+
+    private function RemoveActiveValve(int $ValveID)
+    {
+        $active = array_values(array_filter(
+            $this->ReadActiveValves(),
+            function ($id) use ($ValveID) {
+                return (int) $id !== $ValveID;
+            }
+        ));
+        $this->WriteActiveValves($active);
     }
 
     private function IsUsableBooleanActionVariable(int $VariableID)
