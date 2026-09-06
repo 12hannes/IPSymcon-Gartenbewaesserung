@@ -78,8 +78,6 @@ class ChatGPTGartenbewaesserung extends IPSModule
             $runtimeID = $this->RegisterVariableInteger($base . '_Runtime', $valve['Name'] . ' Laufzeit', 'CGI.Minutes', 101 + $activeConfiguredValves * 10);
             $this->EnableAction($base . '_Runtime');
 
-            // Migration von der bisherigen Integer-Sekundenvariable auf eine String-Variable.
-            // Damit zeigt auch IPSView die Restlaufzeit direkt als MM:SS an.
             $remainingIdent = $base . '_Remaining';
             $existingRemainingID = @$this->GetIDForIdent($remainingIdent);
             if ($existingRemainingID > 0) {
@@ -385,11 +383,9 @@ class ChatGPTGartenbewaesserung extends IPSModule
 
     private function ScheduleMainValveCloseIfPossible(bool $Force = false)
     {
-        if (!$Force) {
-            if ($this->AnyConfiguredValvePhysicallyOpen() || $this->HasPendingStarts()) {
-                $this->WriteAttributeInteger('MainCloseDue', 0);
-                return;
-            }
+        if (!$Force && $this->AnyConfiguredValveActive()) {
+            $this->WriteAttributeInteger('MainCloseDue', 0);
+            return;
         }
 
         $delaySeconds = (int) ceil($this->GetCloseDelay() / 1000);
@@ -407,7 +403,8 @@ class ChatGPTGartenbewaesserung extends IPSModule
             return;
         }
 
-        if ($this->HasPendingStarts() || $this->AnyConfiguredValvePhysicallyOpen()) {
+        // Sicherheitspruefung direkt vor dem Schliessen: irgendein aktiver Kreis haelt den Haupthahn offen.
+        if ($this->AnyConfiguredValveActive()) {
             $this->WriteAttributeInteger('MainCloseDue', 0);
             return;
         }
@@ -531,6 +528,51 @@ class ChatGPTGartenbewaesserung extends IPSModule
         }
 
         return $result;
+    }
+
+    private function AnyConfiguredValveActive()
+    {
+        $valves = $this->GetConfiguredValves();
+        if (!is_array($valves)) {
+            return false;
+        }
+
+        $endTimes = $this->ReadEndTimes();
+        $pendingStarts = $this->ReadPendingStarts();
+        $now = time();
+
+        foreach ($valves as $valve) {
+            if (!$valve['Enabled']) {
+                continue;
+            }
+
+            $valveID = (int) $valve['ValveID'];
+            $key = (string) $valveID;
+            $base = $this->IdentBase($valveID);
+
+            // 1. Virtueller Schalter des Moduls.
+            $switchID = @$this->GetIDForIdent($base . '_Switch');
+            if ($switchID > 0 && @GetValueBoolean($switchID)) {
+                return true;
+            }
+
+            // 2. Noch nicht ausgefuehrter Start.
+            if (isset($pendingStarts[$key])) {
+                return true;
+            }
+
+            // 3. Laufende, noch nicht abgelaufene Bewaesserung.
+            if (isset($endTimes[$key]) && (int) $endTimes[$key] > $now) {
+                return true;
+            }
+
+            // 4. Physischer Hardwarezustand als letzte Sicherheitsstufe.
+            if (IPS_VariableExists($valveID) && @GetValueBoolean($valveID)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function AnyConfiguredValvePhysicallyOpen(int $IgnoreValveID = 0)
