@@ -1,0 +1,110 @@
+{
+  "elements": [
+    {
+      "type": "Label",
+      "label": "Zentrale Gartenbewässerung mit gemeinsamem Haupthahn und beliebig vielen Ventilen."
+    },
+    {
+      "type": "SelectVariable",
+      "name": "MainValveID",
+      "caption": "Haupthahn",
+      "validVariableTypes": [0],
+      "requiredAction": 1
+    },
+    {
+      "type": "NumberSpinner",
+      "name": "SwitchDelay",
+      "caption": "Schaltverzögerung in Millisekunden",
+      "minimum": 0,
+      "maximum": 10000,
+      "suffix": " ms"
+    },
+    {
+      "type": "NumberSpinner",
+      "name": "DefaultRuntime",
+      "caption": "Standardlaufzeit",
+      "minimum": 1,
+      "maximum": 240,
+      "suffix": " min"
+    },
+    {
+      "type": "NumberSpinner",
+      "name": "MaximumRuntime",
+      "caption": "Maximale Laufzeit",
+      "minimum": 1,
+      "maximum": 1440,
+      "suffix": " min"
+    },
+    {
+      "type": "List",
+      "name": "Valves",
+      "caption": "Bewässerungsventile",
+      "rowCount": 6,
+      "add": true,
+      "delete": true,
+      "columns": [
+        {
+          "caption": "Aktiv",
+          "name": "Enabled",
+          "width": "70px",
+          "edit": {
+            "type": "CheckBox"
+          }
+        },
+        {
+          "caption": "Name",
+          "name": "Name",
+          "width": "250px",
+          "edit": {
+            "type": "ValidationTextBox"
+          }
+        },
+        {
+          "caption": "Hardware-Variable",
+          "name": "ValveID",
+          "width": "250px",
+          "edit": {
+            "type": "SelectVariable",
+            "validVariableTypes": [0],
+            "requiredAction": 1
+          }
+        },
+        {
+          "caption": "Standardlaufzeit",
+          "name": "Runtime",
+          "width": "150px",
+          "edit": {
+            "type": "NumberSpinner",
+            "minimum": 1,
+            "maximum": 240,
+            "suffix": " min"
+          }
+        }
+      ],
+      "values": []
+    }
+  ],
+  "actions": [
+    {
+      "type": "Label",
+      "label": "Die eigentliche Bedienung erfolgt über die vom Modul erzeugten Variablen, z. B. in IPSView."
+    }
+  ],
+  "status": [
+    {
+      "code": 102,
+      "icon": "active",
+      "caption": "Aktiv"
+    },
+    {
+      "code": 201,
+      "icon": "error",
+      "caption": "Haupthahn nicht konfiguriert"
+    },
+    {
+      "code": 202,
+      "icon": "error",
+      "caption": "Ungültige Ventilkonfiguration"
+    }
+  ]
+}

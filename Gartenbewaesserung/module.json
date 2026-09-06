@@ -1,0 +1,14 @@
+{
+  "id": "{93F4B683-D12A-4A14-8B0B-C5EE9927BA31}",
+  "name": "ChatGPT Gartenbewaesserung",
+  "type": 3,
+  "vendor": "ChatGPT",
+  "aliases": [
+    "Gartenbewaesserung"
+  ],
+  "url": "",
+  "parentRequirements": [],
+  "childRequirements": [],
+  "implemented": [],
+  "prefix": "CGI"
+}
