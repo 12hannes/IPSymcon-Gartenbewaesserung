@@ -26,9 +26,11 @@ class ChatGPTGartenbewaesserung extends IPSModule
         $this->RegisterAttributeString('EndTimes', '{}');
         $this->RegisterAttributeString('PendingStarts', '{}');
         $this->RegisterAttributeInteger('MainCloseDue', 0);
+        $this->RegisterAttributeString('ConfiguredRuntimes', '{}');
 
         $this->RegisterTimer('Tick', 0, 'CGI_Tick($_IPS[\'TARGET\']);');
         $this->RegisterVariableString('SystemStatus', 'Systemstatus', '', 1);
+        $this->RegisterVariableString('ModuleVersion', 'Modulversion', '', 2);
     }
 
     public function ApplyChanges()
@@ -36,6 +38,7 @@ class ChatGPTGartenbewaesserung extends IPSModule
         parent::ApplyChanges();
 
         $this->CreateProfiles();
+        $this->SetValue('ModuleVersion', '1.3.0');
 
         $mainValveID = $this->ReadPropertyInteger('MainValveID');
         if (!$this->IsUsableBooleanActionVariable($mainValveID)) {
@@ -56,6 +59,8 @@ class ChatGPTGartenbewaesserung extends IPSModule
         $activeConfiguredValves = 0;
         $endTimes = $this->ReadEndTimes();
         $pendingStarts = $this->ReadPendingStarts();
+        $previousConfiguredRuntimes = $this->ReadConfiguredRuntimes();
+        $currentConfiguredRuntimes = [];
 
         foreach ($valves as $valve) {
             if (!$valve['Enabled']) {
@@ -89,11 +94,17 @@ class ChatGPTGartenbewaesserung extends IPSModule
             $remainingID = $this->RegisterVariableString($remainingIdent, $valve['Name'] . ' Restlaufzeit', '', 102 + $activeConfiguredValves * 10);
             $this->RegisterVariableString($base . '_Status', $valve['Name'] . ' Status', '', 103 + $activeConfiguredValves * 10);
 
-            if (GetValueInteger($runtimeID) <= 0) {
-                SetValueInteger($runtimeID, $this->ClampRuntime($valve['Runtime']));
+            $valveKey = (string) $valve['ValveID'];
+            $configuredRuntime = $this->ClampRuntime($valve['Runtime']);
+            $currentConfiguredRuntimes[$valveKey] = $configuredRuntime;
+            $previousRuntime = isset($previousConfiguredRuntimes[$valveKey]) ? (int) $previousConfiguredRuntimes[$valveKey] : null;
+
+            // Eine geaenderte Standardlaufzeit aus der Modulkonfiguration genau einmal uebernehmen.
+            // Manuelle Laufzeitaenderungen in IPSView bleiben danach erhalten, bis die Konfiguration erneut geaendert wird.
+            if ($previousRuntime === null || $previousRuntime !== $configuredRuntime || GetValueInteger($runtimeID) <= 0) {
+                SetValueInteger($runtimeID, $configuredRuntime);
             }
 
-            $valveKey = (string) $valve['ValveID'];
             $endTime = isset($endTimes[$valveKey]) ? (int) $endTimes[$valveKey] : 0;
             $pending = isset($pendingStarts[$valveKey]);
             $physicallyOpen = @GetValueBoolean($valve['ValveID']);
@@ -116,6 +127,7 @@ class ChatGPTGartenbewaesserung extends IPSModule
             }
         }
 
+        $this->WriteConfiguredRuntimes($currentConfiguredRuntimes);
         $this->WriteEndTimes($endTimes);
         $this->SetStatus(102);
         $this->SetValue('SystemStatus', $activeConfiguredValves . ' Bewaesserungskreis(e) konfiguriert');
@@ -403,7 +415,6 @@ class ChatGPTGartenbewaesserung extends IPSModule
             return;
         }
 
-        // Sicherheitspruefung direkt vor dem Schliessen: irgendein aktiver Kreis haelt den Haupthahn offen.
         if ($this->AnyConfiguredValveActive()) {
             $this->WriteAttributeInteger('MainCloseDue', 0);
             return;
@@ -550,23 +561,19 @@ class ChatGPTGartenbewaesserung extends IPSModule
             $key = (string) $valveID;
             $base = $this->IdentBase($valveID);
 
-            // 1. Virtueller Schalter des Moduls.
             $switchID = @$this->GetIDForIdent($base . '_Switch');
             if ($switchID > 0 && @GetValueBoolean($switchID)) {
                 return true;
             }
 
-            // 2. Noch nicht ausgefuehrter Start.
             if (isset($pendingStarts[$key])) {
                 return true;
             }
 
-            // 3. Laufende, noch nicht abgelaufene Bewaesserung.
             if (isset($endTimes[$key]) && (int) $endTimes[$key] > $now) {
                 return true;
             }
 
-            // 4. Physischer Hardwarezustand als letzte Sicherheitsstufe.
             if (IPS_VariableExists($valveID) && @GetValueBoolean($valveID)) {
                 return true;
             }
@@ -653,6 +660,17 @@ class ChatGPTGartenbewaesserung extends IPSModule
     private function WritePendingStarts(array $PendingStarts)
     {
         $this->WriteAttributeString('PendingStarts', json_encode($PendingStarts));
+    }
+
+    private function ReadConfiguredRuntimes()
+    {
+        $data = json_decode($this->ReadAttributeString('ConfiguredRuntimes'), true);
+        return is_array($data) ? $data : [];
+    }
+
+    private function WriteConfiguredRuntimes(array $Runtimes)
+    {
+        $this->WriteAttributeString('ConfiguredRuntimes', json_encode($Runtimes));
     }
 
     private function RemovePendingStart(int $ValveID)
