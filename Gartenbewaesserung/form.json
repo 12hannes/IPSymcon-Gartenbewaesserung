@@ -55,6 +55,7 @@
           "caption": "Aktiv",
           "name": "Enabled",
           "width": "70px",
+          "add": true,
           "edit": {
             "type": "CheckBox"
           }
@@ -63,6 +64,7 @@
           "caption": "Name",
           "name": "Name",
           "width": "250px",
+          "add": "Neuer Bewässerungskreis",
           "edit": {
             "type": "ValidationTextBox"
           }
@@ -71,6 +73,7 @@
           "caption": "Hardware-Variable",
           "name": "ValveID",
           "width": "250px",
+          "add": 0,
           "edit": {
             "type": "SelectVariable",
             "validVariableTypes": [0],
@@ -81,6 +84,7 @@
           "caption": "Standardlaufzeit",
           "name": "Runtime",
           "width": "150px",
+          "add": 20,
           "edit": {
             "type": "NumberSpinner",
             "minimum": 1,
