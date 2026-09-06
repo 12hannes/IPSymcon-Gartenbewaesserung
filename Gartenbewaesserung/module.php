@@ -7,7 +7,8 @@ class ChatGPTGartenbewaesserung extends IPSModule
         parent::Create();
 
         $this->RegisterPropertyInteger('MainValveID', 55511);
-        $this->RegisterPropertyInteger('SwitchDelay', 1000);
+        $this->RegisterPropertyInteger('OpenDelay', 1000);
+        $this->RegisterPropertyInteger('CloseDelay', 5000);
         $this->RegisterPropertyInteger('DefaultRuntime', 20);
         $this->RegisterPropertyInteger('MaximumRuntime', 180);
         $this->RegisterPropertyString(
@@ -22,10 +23,16 @@ class ChatGPTGartenbewaesserung extends IPSModule
             ])
         );
 
-        // Endzeit je Hardware-Ventil-ID als Unix-Timestamp.
+        // Laufende Bewaesserungen: Ventil-ID => Endzeit (Unix-Timestamp).
         $this->RegisterAttributeString('EndTimes', '{}');
 
-        // Ein zentraler 1-Sekunden-Timer reicht auch für mehrere parallele Kreise.
+        // Asynchrone Startvorgaenge: Ventil-ID => fruehester Startzeitpunkt (Unix-Timestamp).
+        $this->RegisterAttributeString('PendingStarts', '{}');
+
+        // Zeitpunkt, zu dem der Haupthahn geschlossen werden darf. 0 = nicht geplant.
+        $this->RegisterAttributeInteger('MainCloseDue', 0);
+
+        // Ein zentraler Timer verarbeitet Restlaufzeiten und alle Schaltverzoegerungen.
         $this->RegisterTimer('Tick', 0, 'CGI_Tick($_IPS[\'TARGET\']);');
 
         $this->RegisterVariableString('SystemStatus', 'Systemstatus', '', 1);
@@ -48,12 +55,15 @@ class ChatGPTGartenbewaesserung extends IPSModule
         $valves = $this->GetConfiguredValves();
         if ($valves === null) {
             $this->SetStatus(202);
-            $this->SetValue('SystemStatus', 'Ventilkonfiguration ist ungültig');
+            $this->SetValue('SystemStatus', 'Ventilkonfiguration ist ungueltig');
             $this->SetTimerInterval('Tick', 0);
             return;
         }
 
         $activeConfiguredValves = 0;
+        $endTimes = $this->ReadEndTimes();
+        $pendingStarts = $this->ReadPendingStarts();
+
         foreach ($valves as $valve) {
             if (!$valve['Enabled']) {
                 continue;
@@ -82,25 +92,32 @@ class ChatGPTGartenbewaesserung extends IPSModule
                 SetValueInteger($runtimeID, $this->ClampRuntime($valve['Runtime']));
             }
 
-            $endTimes = $this->ReadEndTimes();
-            $endTime = isset($endTimes[(string) $valve['ValveID']]) ? (int) $endTimes[(string) $valve['ValveID']] : 0;
-            if ($endTime > time() && @GetValueBoolean($valve['ValveID'])) {
+            $valveKey = (string) $valve['ValveID'];
+            $endTime = isset($endTimes[$valveKey]) ? (int) $endTimes[$valveKey] : 0;
+            $pending = isset($pendingStarts[$valveKey]);
+            $physicallyOpen = @GetValueBoolean($valve['ValveID']);
+
+            if ($pending) {
+                SetValueBoolean($switchID, true);
+                SetValueInteger($remainingID, 0);
+                SetValueString($this->GetIDForIdent($base . '_Status'), 'Startet - Ventil oeffnet nach Verzoegerung');
+            } elseif ($endTime > time() && $physicallyOpen) {
                 SetValueBoolean($switchID, true);
                 SetValueInteger($remainingID, max(0, $endTime - time()));
-                SetValueString($this->GetIDForIdent($base . '_Status'), 'Bewässert');
+                SetValueString($this->GetIDForIdent($base . '_Status'), 'Bewaessert');
             } else {
                 if ($endTime > 0 && $endTime <= time()) {
-                    unset($endTimes[(string) $valve['ValveID']]);
-                    $this->WriteEndTimes($endTimes);
+                    unset($endTimes[$valveKey]);
                 }
                 SetValueBoolean($switchID, false);
                 SetValueInteger($remainingID, 0);
-                SetValueString($this->GetIDForIdent($base . '_Status'), @GetValueBoolean($valve['ValveID']) ? 'Extern aktiv' : 'Aus');
+                SetValueString($this->GetIDForIdent($base . '_Status'), $physicallyOpen ? 'Extern aktiv' : 'Aus');
             }
         }
 
+        $this->WriteEndTimes($endTimes);
         $this->SetStatus(102);
-        $this->SetValue('SystemStatus', $activeConfiguredValves . ' Bewässerungskreis(e) konfiguriert');
+        $this->SetValue('SystemStatus', $activeConfiguredValves . ' Bewaesserungskreis(e) konfiguriert');
         $this->UpdateTimerState();
     }
 
@@ -120,15 +137,14 @@ class ChatGPTGartenbewaesserung extends IPSModule
             $valveID = (int) $m[1];
             $valve = $this->FindValve($valveID);
             if ($valve === null) {
-                throw new Exception('Unbekanntes Bewässerungsventil');
+                throw new Exception('Unbekanntes Bewaesserungsventil');
             }
 
             $runtime = $this->ClampRuntime((int) $Value);
             SetValueInteger($this->GetIDForIdent($Ident), $runtime);
 
-            // Bei laufender Bewässerung wird die Endzeit ab jetzt neu gesetzt.
-            $base = $this->IdentBase($valveID);
-            if (GetValueBoolean($this->GetIDForIdent($base . '_Switch'))) {
+            // Bei bereits laufender Bewaesserung wird die Endzeit ab jetzt neu gesetzt.
+            if (@GetValueBoolean($valveID)) {
                 $endTimes = $this->ReadEndTimes();
                 $endTimes[(string) $valveID] = time() + ($runtime * 60);
                 $this->WriteEndTimes($endTimes);
@@ -137,7 +153,7 @@ class ChatGPTGartenbewaesserung extends IPSModule
             return;
         }
 
-        throw new Exception('Ungültiger Ident: ' . $Ident);
+        throw new Exception('Ungueltiger Ident: ' . $Ident);
     }
 
     public function StartValve(int $ValveID)
@@ -149,44 +165,50 @@ class ChatGPTGartenbewaesserung extends IPSModule
 
         $mainValveID = $this->ReadPropertyInteger('MainValveID');
         if (!$this->IsUsableBooleanActionVariable($mainValveID) || !$this->IsUsableBooleanActionVariable($ValveID)) {
-            throw new Exception('Haupthahn oder Bewässerungsventil ist nicht schaltbar');
+            throw new Exception('Haupthahn oder Bewaesserungsventil ist nicht schaltbar');
         }
 
         $base = $this->IdentBase($ValveID);
         $switchID = $this->GetIDForIdent($base . '_Switch');
-        $runtimeID = $this->GetIDForIdent($base . '_Runtime');
         $statusID = $this->GetIDForIdent($base . '_Status');
 
+        // Einen eventuell geplanten Schliessvorgang des Haupthahns abbrechen.
+        $this->WriteAttributeInteger('MainCloseDue', 0);
+
         try {
-            // Gewünschte Reihenfolge: Haupthahn zuerst.
-            \RequestAction($mainValveID, true);
-            IPS_Sleep($this->GetDelay());
-
-            // Danach Gartenventil.
-            \RequestAction($ValveID, true);
-
-            $runtime = $this->ClampRuntime(GetValueInteger($runtimeID));
-            SetValueInteger($runtimeID, $runtime);
-
-            $endTimes = $this->ReadEndTimes();
-            $endTimes[(string) $ValveID] = time() + ($runtime * 60);
-            $this->WriteEndTimes($endTimes);
+            // Haupthahn sofort oeffnen, falls er noch geschlossen ist.
+            if (!@GetValueBoolean($mainValveID)) {
+                \RequestAction($mainValveID, true);
+            }
 
             SetValueBoolean($switchID, true);
-            SetValueString($statusID, 'Bewässert');
-            $this->UpdateValveStatus($ValveID);
+
+            // Falls das Ventil bereits physisch offen ist, direkt die Laufzeit starten/erneuern.
+            if (@GetValueBoolean($ValveID)) {
+                $this->ActivateValveRuntime($ValveID);
+                return;
+            }
+
+            // Ventil asynchron nach der Einschaltverzoegerung oeffnen.
+            $delaySeconds = (int) ceil($this->GetOpenDelay() / 1000);
+            $pendingStarts = $this->ReadPendingStarts();
+            $pendingStarts[(string) $ValveID] = time() + $delaySeconds;
+            $this->WritePendingStarts($pendingStarts);
+
+            SetValueString($statusID, $delaySeconds > 0 ? 'Startet - Ventil oeffnet in ' . $delaySeconds . ' s' : 'Startet');
+
+            // Bei 0 ms ohne auf den naechsten Tick zu warten direkt verarbeiten.
+            if ($delaySeconds === 0) {
+                $this->ProcessPendingStarts();
+            }
+
             $this->UpdateTimerState();
         } catch (Throwable $e) {
             SetValueBoolean($switchID, false);
             SetValueString($statusID, 'Fehler: ' . $e->getMessage());
-
-            // Wenn kein anderes Gartenventil offen ist, Haupthahn sicher schließen.
-            if (!$this->AnyConfiguredValvePhysicallyOpen($ValveID)) {
-                try {
-                    \RequestAction($mainValveID, false);
-                } catch (Throwable $ignored) {
-                }
-            }
+            $this->RemovePendingStart($ValveID);
+            $this->ScheduleMainValveCloseIfPossible();
+            $this->UpdateTimerState();
             throw $e;
         }
     }
@@ -198,15 +220,19 @@ class ChatGPTGartenbewaesserung extends IPSModule
             throw new Exception('Ventil ist nicht konfiguriert');
         }
 
-        $mainValveID = $this->ReadPropertyInteger('MainValveID');
         $base = $this->IdentBase($ValveID);
         $switchID = $this->GetIDForIdent($base . '_Switch');
         $remainingID = $this->GetIDForIdent($base . '_Remaining');
         $statusID = $this->GetIDForIdent($base . '_Status');
 
         try {
-            // Gewünschte Reihenfolge: Gartenventil zuerst schließen.
-            \RequestAction($ValveID, false);
+            // Einen noch nicht ausgefuehrten Start dieses Ventils abbrechen.
+            $this->RemovePendingStart($ValveID);
+
+            // Gartenventil zuerst sofort schliessen.
+            if (@GetValueBoolean($ValveID)) {
+                \RequestAction($ValveID, false);
+            }
 
             SetValueBoolean($switchID, false);
             SetValueInteger($remainingID, 0);
@@ -216,13 +242,8 @@ class ChatGPTGartenbewaesserung extends IPSModule
             unset($endTimes[(string) $ValveID]);
             $this->WriteEndTimes($endTimes);
 
-            IPS_Sleep($this->GetDelay());
-
-            // Haupthahn nur schließen, wenn kein anderes konfiguriertes Ventil offen ist.
-            if (!$this->AnyConfiguredValvePhysicallyOpen()) {
-                \RequestAction($mainValveID, false);
-            }
-
+            // Haupthahn erst nach der konfigurierten Ausschaltverzoegerung schliessen.
+            $this->ScheduleMainValveCloseIfPossible();
             $this->UpdateTimerState();
         } catch (Throwable $e) {
             SetValueString($statusID, 'Fehler: ' . $e->getMessage());
@@ -237,14 +258,19 @@ class ChatGPTGartenbewaesserung extends IPSModule
             return;
         }
 
-        // Alle Gartenventile zuerst schließen.
+        // Keine geplanten Starts mehr zulassen.
+        $this->WritePendingStarts([]);
+
+        // Alle Gartenventile zuerst schliessen.
         foreach ($valves as $valve) {
             if (!$valve['Enabled'] || !$this->IsUsableBooleanActionVariable($valve['ValveID'])) {
                 continue;
             }
 
             try {
-                \RequestAction($valve['ValveID'], false);
+                if (@GetValueBoolean($valve['ValveID'])) {
+                    \RequestAction($valve['ValveID'], false);
+                }
             } catch (Throwable $e) {
                 $this->SendDebug('StopAll', $valve['Name'] . ': ' . $e->getMessage(), 0);
             }
@@ -256,21 +282,95 @@ class ChatGPTGartenbewaesserung extends IPSModule
         }
 
         $this->WriteEndTimes([]);
-        IPS_Sleep($this->GetDelay());
-
-        $mainValveID = $this->ReadPropertyInteger('MainValveID');
-        if ($this->IsUsableBooleanActionVariable($mainValveID)) {
-            \RequestAction($mainValveID, false);
-        }
-
-        $this->SetTimerInterval('Tick', 0);
+        $this->ScheduleMainValveCloseIfPossible(true);
+        $this->UpdateTimerState();
     }
 
     public function Tick()
     {
+        $this->ProcessPendingStarts();
+        $this->ProcessRuntimeTimeouts();
+        $this->ProcessMainValveClose();
+        $this->UpdateRunningValveStatuses();
+        $this->UpdateTimerState();
+    }
+
+    private function ProcessPendingStarts()
+    {
+        $pendingStarts = $this->ReadPendingStarts();
+        if (count($pendingStarts) === 0) {
+            return;
+        }
+
+        $now = time();
+
+        foreach ($pendingStarts as $valveIDString => $due) {
+            if ((int) $due > $now) {
+                continue;
+            }
+
+            $valveID = (int) $valveIDString;
+            unset($pendingStarts[$valveIDString]);
+
+            $valve = $this->FindValve($valveID);
+            if ($valve === null || !$valve['Enabled']) {
+                continue;
+            }
+
+            $base = $this->IdentBase($valveID);
+            $switchID = @$this->GetIDForIdent($base . '_Switch');
+            $statusID = @$this->GetIDForIdent($base . '_Status');
+
+            // Wurde der virtuelle Schalter waehrend der Wartezeit wieder ausgeschaltet, nicht oeffnen.
+            if ($switchID <= 0 || !GetValueBoolean($switchID)) {
+                continue;
+            }
+
+            try {
+                $mainValveID = $this->ReadPropertyInteger('MainValveID');
+                if (!@GetValueBoolean($mainValveID)) {
+                    \RequestAction($mainValveID, true);
+                }
+
+                \RequestAction($valveID, true);
+                $this->ActivateValveRuntime($valveID);
+            } catch (Throwable $e) {
+                if ($switchID > 0) {
+                    SetValueBoolean($switchID, false);
+                }
+                if ($statusID > 0) {
+                    SetValueString($statusID, 'Fehler: ' . $e->getMessage());
+                }
+                $this->ScheduleMainValveCloseIfPossible();
+            }
+        }
+
+        $this->WritePendingStarts($pendingStarts);
+    }
+
+    private function ActivateValveRuntime(int $ValveID)
+    {
+        $base = $this->IdentBase($ValveID);
+        $runtimeID = $this->GetIDForIdent($base . '_Runtime');
+        $switchID = $this->GetIDForIdent($base . '_Switch');
+        $statusID = $this->GetIDForIdent($base . '_Status');
+
+        $runtime = $this->ClampRuntime(GetValueInteger($runtimeID));
+        SetValueInteger($runtimeID, $runtime);
+
+        $endTimes = $this->ReadEndTimes();
+        $endTimes[(string) $ValveID] = time() + ($runtime * 60);
+        $this->WriteEndTimes($endTimes);
+
+        SetValueBoolean($switchID, true);
+        SetValueString($statusID, 'Bewaessert');
+        $this->UpdateValveStatus($ValveID);
+    }
+
+    private function ProcessRuntimeTimeouts()
+    {
         $endTimes = $this->ReadEndTimes();
         if (count($endTimes) === 0) {
-            $this->SetTimerInterval('Tick', 0);
             return;
         }
 
@@ -278,11 +378,8 @@ class ChatGPTGartenbewaesserung extends IPSModule
         $toStop = [];
 
         foreach ($endTimes as $valveIDString => $endTime) {
-            $valveID = (int) $valveIDString;
             if ((int) $endTime <= $now) {
-                $toStop[] = $valveID;
-            } else {
-                $this->UpdateValveStatus($valveID);
+                $toStop[] = (int) $valveIDString;
             }
         }
 
@@ -293,8 +390,58 @@ class ChatGPTGartenbewaesserung extends IPSModule
                 $this->SendDebug('AutoStop', 'Ventil ' . $valveID . ': ' . $e->getMessage(), 0);
             }
         }
+    }
 
-        $this->UpdateTimerState();
+    private function ScheduleMainValveCloseIfPossible(bool $Force = false)
+    {
+        if (!$Force) {
+            if ($this->AnyConfiguredValvePhysicallyOpen() || $this->HasPendingStarts()) {
+                $this->WriteAttributeInteger('MainCloseDue', 0);
+                return;
+            }
+        }
+
+        $delaySeconds = (int) ceil($this->GetCloseDelay() / 1000);
+        $this->WriteAttributeInteger('MainCloseDue', time() + $delaySeconds);
+
+        if ($delaySeconds === 0) {
+            $this->ProcessMainValveClose();
+        }
+    }
+
+    private function ProcessMainValveClose()
+    {
+        $due = $this->ReadAttributeInteger('MainCloseDue');
+        if ($due <= 0 || $due > time()) {
+            return;
+        }
+
+        // Ein neuer Start oder ein weiterhin offenes Ventil verhindert das Schliessen.
+        if ($this->HasPendingStarts() || $this->AnyConfiguredValvePhysicallyOpen()) {
+            $this->WriteAttributeInteger('MainCloseDue', 0);
+            return;
+        }
+
+        $mainValveID = $this->ReadPropertyInteger('MainValveID');
+        try {
+            if ($this->IsUsableBooleanActionVariable($mainValveID) && @GetValueBoolean($mainValveID)) {
+                \RequestAction($mainValveID, false);
+            }
+            $this->WriteAttributeInteger('MainCloseDue', 0);
+        } catch (Throwable $e) {
+            $this->SetValue('SystemStatus', 'Fehler beim Schliessen des Haupthahns: ' . $e->getMessage());
+            // Beim naechsten Tick erneut versuchen.
+        }
+    }
+
+    private function UpdateRunningValveStatuses()
+    {
+        $endTimes = $this->ReadEndTimes();
+        foreach ($endTimes as $valveIDString => $endTime) {
+            if ((int) $endTime > time()) {
+                $this->UpdateValveStatus((int) $valveIDString);
+            }
+        }
     }
 
     private function UpdateValveStatus(int $ValveID)
@@ -312,21 +459,28 @@ class ChatGPTGartenbewaesserung extends IPSModule
         $switchID = @$this->GetIDForIdent($base . '_Switch');
         $statusID = @$this->GetIDForIdent($base . '_Status');
         if ($switchID > 0 && $statusID > 0 && GetValueBoolean($switchID)) {
-            SetValueString($statusID, 'Bewässert - ' . $this->FormatSeconds($remaining) . ' verbleibend');
+            SetValueString($statusID, 'Bewaessert - ' . $this->FormatSeconds($remaining) . ' verbleibend');
         }
     }
 
     private function UpdateTimerState()
     {
-        $endTimes = $this->ReadEndTimes();
         $active = false;
         $now = time();
 
-        foreach ($endTimes as $endTime) {
+        foreach ($this->ReadEndTimes() as $endTime) {
             if ((int) $endTime > $now) {
                 $active = true;
                 break;
             }
+        }
+
+        if (!$active && $this->HasPendingStarts()) {
+            $active = true;
+        }
+
+        if (!$active && $this->ReadAttributeInteger('MainCloseDue') > 0) {
+            $active = true;
         }
 
         $this->SetTimerInterval('Tick', $active ? 1000 : 0);
@@ -433,9 +587,14 @@ class ChatGPTGartenbewaesserung extends IPSModule
         return max(1, min($maximum, $Minutes));
     }
 
-    private function GetDelay()
+    private function GetOpenDelay()
     {
-        return max(0, min(10000, $this->ReadPropertyInteger('SwitchDelay')));
+        return max(0, min(10000, $this->ReadPropertyInteger('OpenDelay')));
+    }
+
+    private function GetCloseDelay()
+    {
+        return max(0, min(30000, $this->ReadPropertyInteger('CloseDelay')));
     }
 
     private function IdentBase(int $ValveID)
@@ -452,6 +611,29 @@ class ChatGPTGartenbewaesserung extends IPSModule
     private function WriteEndTimes(array $EndTimes)
     {
         $this->WriteAttributeString('EndTimes', json_encode($EndTimes));
+    }
+
+    private function ReadPendingStarts()
+    {
+        $data = json_decode($this->ReadAttributeString('PendingStarts'), true);
+        return is_array($data) ? $data : [];
+    }
+
+    private function WritePendingStarts(array $PendingStarts)
+    {
+        $this->WriteAttributeString('PendingStarts', json_encode($PendingStarts));
+    }
+
+    private function RemovePendingStart(int $ValveID)
+    {
+        $pendingStarts = $this->ReadPendingStarts();
+        unset($pendingStarts[(string) $ValveID]);
+        $this->WritePendingStarts($pendingStarts);
+    }
+
+    private function HasPendingStarts()
+    {
+        return count($this->ReadPendingStarts()) > 0;
     }
 
     private function FormatSeconds(int $Seconds)
