@@ -13,10 +13,18 @@
     },
     {
       "type": "NumberSpinner",
-      "name": "SwitchDelay",
-      "caption": "Schaltverzögerung in Millisekunden",
+      "name": "OpenDelay",
+      "caption": "Verzögerung beim Einschalten",
       "minimum": 0,
       "maximum": 10000,
+      "suffix": " ms"
+    },
+    {
+      "type": "NumberSpinner",
+      "name": "CloseDelay",
+      "caption": "Verzögerung beim Ausschalten",
+      "minimum": 0,
+      "maximum": 30000,
       "suffix": " ms"
     },
     {
@@ -87,7 +95,7 @@
   "actions": [
     {
       "type": "Label",
-      "label": "Die eigentliche Bedienung erfolgt über die vom Modul erzeugten Variablen, z. B. in IPSView."
+      "label": "Die Bedienung erfolgt über die vom Modul erzeugten Variablen, z. B. in IPSView. Verzögerungen werden per Timer umgesetzt, nicht per IPS_Sleep()."
     }
   ],
   "status": [
